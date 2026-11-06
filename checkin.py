@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Trae 每日签到脚本（GitHub Actions 版）
+Trae 每日签到脚本（GitHub Actions 版）— 支持自动续期
 
-原理：
-  Trae 网页端的 JWT 只有 8 小时有效期，但真正的会话凭证是 HttpOnly Cookie
-  `X-Cloudide-Session`（约 14 天有效）。本脚本通过该 Cookie 调用
-  `GetUserToken` 接口换取全新 JWT，再用新 JWT 执行每日签到。
+凭证链路（推荐 TRAE_PASSPORT，全自动换发）：
+  TRAE_PASSPORT (sid_guard 等 Passport Cookie, ~60 天)
+      → POST /cloudide/api/v3/trae/Login        换发全新 X-Cloudide-Session (14 天)
+      → POST /cloudide/api/v3/common/GetUserToken  换取 JWT (8 小时)
+      → POST /trae/api/v2/ug/checkin_credits/claim  执行签到
+
+兼容旧部署：仅有 TRAE_SESSION（X-Cloudide-Session，~14 天）时按旧链路直连。
 
 依赖：仅标准库，无第三方依赖。
 
 环境变量：
-  TRAE_SESSION        账号 1 的 X-Cloudide-Session Cookie（必填；后端兼容单账号部署）
-  TRAE_DEVICE_ID      账号 1 的 x-device-id，16 位数字（选填，缺省随机）
-  TRAE_SESSION_N      第 N(N≥2) 个账号的会话 Cookie；缺失即停止读取更多账号
-  TRAE_DEVICE_ID_N    第 N 个账号的 x-device-id（选填，缺省随机）
-  全部账号共享：       FEISHU_WEBHOOK（选填，签到后推送一条汇总）
+  TRAE_PASSPORT        账号 1 的 Passport Cookie（推荐，如 "sid_guard=xxx; passport_csrf_token=xxx"）
+  TRAE_SESSION         账号 1 的 X-Cloudide-Session Cookie（旧方式；PASSPORT 存在时优先 PASSPORT）
+  TRAE_DEVICE_ID       账号 1 的 x-device-id，16 位数字（选填，缺省随机）
+  TRAE_PASSPORT_N      第 N(N≥2) 个账号的 Passport Cookie；与 TRAE_SESSION_N 至少其一
+  TRAE_SESSION_N       第 N 个账号的 X-Cloudide-Session
+  TRAE_DEVICE_ID_N     第 N 个账号的 x-device-id（选填）
+  FEISHU_WEBHOOK       全部账号共享（选填，签到后推送一条汇总）
 
 用法：
   python checkin.py
@@ -25,6 +30,7 @@ import datetime
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.request
@@ -43,6 +49,48 @@ def _post(path, headers, body=""):
         return e.code, e.read().decode("utf-8", errors="replace")
 
 
+def login_for_session(passport_cookie: str) -> str:
+    """用 Passport Cookie（sid_guard 等）调 /cloudide/api/v3/trae/Login，
+    换发全新 X-Cloudide-Session（每次运行换发，彻底规避 14 天过期）。"""
+    import urllib.error
+    req = urllib.request.Request(
+        BASE + "/cloudide/api/v3/trae/Login",
+        data=b"{}",
+        headers={
+            "Cookie": passport_cookie,
+            "Referer": "https://www.trae.cn/",
+            "Origin": "https://www.trae.cn",
+            "Content-Type": "application/json",
+            "User-Agent": "TraeCheckin/1.0",
+            "Accept": "application/json, text/plain, */*",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = resp.status
+            set_cookies = resp.headers.get_all("Set-Cookie") or []
+            text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        if e.code == 401:
+            raise RuntimeError(
+                "Passport Cookie 已失效(HTTP 401)：sid_guard 约 60 天有效期可能已过。"
+                "请重新登录 trae.cn 并更新 TRAE_PASSPORT。原始返回: " + body[:200])
+        raise RuntimeError("Login 换发 Session 失败: HTTP %s %s" % (e.code, body[:200]))
+    if status != 200:
+        raise RuntimeError("Login 换发 Session 失败: HTTP %s %s" % (status, text[:200]))
+    for c in set_cookies:
+        m = re.search(r"X-Cloudide-Session=([^;]+)", c)
+        if m:
+            return m.group(1)
+    raise RuntimeError("Login 响应未包含 X-Cloudide-Session: " + text[:200])
+
+
 def get_token(session: str) -> str:
     """用 X-Cloudide-Session Cookie 换取全新 JWT。"""
     headers = {
@@ -58,7 +106,6 @@ def get_token(session: str) -> str:
     if status == 401:
         raise RuntimeError(
             "账号会话已失效(HTTP 401)：X-Cloudide-Session 可能已过期(~14天有效期)。"
-            "请在浏览器重新登录 trae.cn 并复制新的 Cookie 值，更新到 TRAE_SESSION 后重试。"
             "原始返回: " + text[:200])
     if status != 200 or not token:
         raise RuntimeError("GetUserToken 失败: HTTP %s %s" % (status, text[:200]))
@@ -96,21 +143,21 @@ def notify_feishu(webhook, text):
 
 def beijing_now_str():
     """返回北京时间字符串（GitHub Actions 运行在 UTC，需 +8 小时）。"""
-    return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def iter_sessions():
-    """按顺序产出 (账号序号, session, device_id)。账号 1 读 TRAE_SESSION；
-    之后依次读 TRAE_SESSION_2, TRAE_SESSION_3… 直到缺空为止。"""
-    s = os.environ.get("TRAE_SESSION", "").strip()
-    if s:
-        yield 1, s, os.environ.get("TRAE_DEVICE_ID", "").strip()
-    n = 2
+def iter_accounts():
+    """按顺序产出 (账号序号, passport, session, device_id)。
+    账号 1 读 TRAE_PASSPORT / TRAE_SESSION；之后依次读 TRAE_PASSPORT_N / TRAE_SESSION_N …
+    直到某序号的两种凭证都缺空为止。"""
+    n = 1
     while True:
-        s = os.environ.get("TRAE_SESSION_%d" % n, "").strip()
-        if not s:
+        passport = os.environ.get("TRAE_PASSPORT" if n == 1 else "TRAE_PASSPORT_%d" % n, "").strip()
+        session = os.environ.get("TRAE_SESSION" if n == 1 else "TRAE_SESSION_%d" % n, "").strip()
+        device_id = os.environ.get("TRAE_DEVICE_ID" if n == 1 else "TRAE_DEVICE_ID_%d" % n, "").strip()
+        if not passport and not session:
             break
-        yield n, s, os.environ.get("TRAE_DEVICE_ID_%d" % n, "").strip()
+        yield n, passport, session, device_id
         n += 1
 
 
@@ -120,16 +167,16 @@ def random_device_id():
 
 
 def main():
-    accounts = list(iter_sessions())
+    accounts = list(iter_accounts())
     if not accounts:
-        print("错误：缺少环境变量 TRAE_SESSION")
+        print("错误：缺少环境变量 TRAE_PASSPORT 或 TRAE_SESSION")
         sys.exit(1)
 
     webhook = os.environ.get("FEISHU_WEBHOOK", "").strip()
     ok_names, fail_names = [], []
     all_ok = True
 
-    for index, session, device_id in accounts:
+    for index, passport, session, device_id in accounts:
         # 多账号之间错开 3~6 秒随机间隔，降低请求密度，规避 9074「参与用户太多」风控
         if index > 1:
             time.sleep(random.uniform(3, 6))
@@ -137,6 +184,10 @@ def main():
         device_id = device_id or random_device_id()
         print("[%s] device_id=%s" % (name, device_id))
         try:
+            # 优先用 Passport Cookie 换发全新 Session（每次运行都换发，规避 14 天过期）
+            if passport:
+                session = login_for_session(passport)
+                print("[%s] 已由 Passport Cookie 换发新 X-Cloudide-Session" % name)
             token = get_token(session)
             print("[%s] 已换取新 JWT，长度=%d" % (name, len(token)))
             result = checkin(token, device_id)
